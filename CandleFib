@@ -1,0 +1,195 @@
+//@version=5
+indicator("Multi-Timeframe Technical Indicators Dashboard (Fixed)", overlay=false)
+
+// Timeframes
+const string TF_1M   = "1"
+const string TF_3M   = "3"
+const string TF_5M   = "5"
+const string TF_15M  = "15"
+const string TF_1H   = "60"
+const string TF_4H   = "240"
+const string TF_1D   = "D"
+
+// Indicator column names (ONE line)
+var string[] ind_names = array.from("Mom(5)", "EMA(12)", "MACD(H)", "ROI%", "RSI(14)", "StochRSI(14)", "ATR(14)", "ADX(14)", "%R(14)", "CCI(20)", "UO(7,14,28)", "Vol(x)", "Bias(15m)", "Signal")
+
+// Table: 15 cols (TF + 14 inds), 8 rows (header + 7 tfs)
+var table dash = table.new(position.bottom_center, 15, 8, bgcolor=color.black, border_width=1)
+
+// Format value
+fmt(v) => na(v) ? "—" : str.tostring(v, "0.00")
+
+header_cell(col, title, tip) =>
+    table.cell(dash, col, 0, title + " ⓘ", text_color=color.white, bgcolor=color.gray, tooltip=tip)
+
+fmt_vol(v) =>
+    if na(v)
+        "—"
+    else
+        av = math.abs(v)
+        av >= 1e9 ? str.tostring(v / 1e9, "0.00") + "B" :
+         av >= 1e6 ? str.tostring(v / 1e6, "0.00") + "M" :
+         av >= 1e3 ? str.tostring(v / 1e3, "0.00") + "K" :
+         str.tostring(v, "0")
+
+fmt_volx(vol, volAvg) =>
+    if na(vol) or na(volAvg) or volAvg == 0
+        "—"
+    else
+        "x" + str.tostring(vol / volAvg, "0.00")
+
+emaBiasLen = input.int(50, "15m EMA Bias Length", minval=1)
+
+// Sum helper (fallback when `ta.sum()` is unavailable)
+sum_n(src, length) =>
+    ta.sma(src, length) * length
+
+// True StochRSI (0..1)
+stochrsi_0_1(src, rsiLen, stochLen) =>
+    r = ta.rsi(src, rsiLen)
+    lo = ta.lowest(r, stochLen)
+    hi = ta.highest(r, stochLen)
+    denom = hi - lo
+    denom == 0 ? na : (r - lo) / denom
+
+// MACD histogram helper
+macd_hist(src) =>
+    [_, __, h] = ta.macd(src, 12, 26, 9)
+    h
+
+// ADX helper (use ta.dmi)
+adx_val(len) =>
+    [_, __, a] = ta.dmi(len, len)
+    a
+
+// Williams %R helper (manual)
+willr_val(len) =>
+    hh = ta.highest(high, len)
+    ll = ta.lowest(low, len)
+    rng = hh - ll
+    rng == 0 ? na : (-100.0 * (hh - close) / rng)
+
+// Ultimate Oscillator helper (manual)
+uo_val(len1, len2, len3) =>
+    prevClose = nz(close[1], close)
+    minLC = math.min(low, prevClose)
+    maxHC = math.max(high, prevClose)
+    bp = close - minLC
+    tr = maxHC - minLC
+
+    sumTR1 = sum_n(tr, len1)
+    sumTR2 = sum_n(tr, len2)
+    sumTR3 = sum_n(tr, len3)
+
+    avg1 = sumTR1 == 0 ? na : sum_n(bp, len1) / sumTR1
+    avg2 = sumTR2 == 0 ? na : sum_n(bp, len2) / sumTR2
+    avg3 = sumTR3 == 0 ? na : sum_n(bp, len3) / sumTR3
+
+    100.0 * ((4.0 * avg1) + (2.0 * avg2) + avg3) / 7.0
+
+// Compute all metrics in the requested timeframe context (bundle into ONE security call per TF)
+calc_metrics() =>
+    mom = close - close[5]
+    ema12 = ta.ema(close, 12)
+    macdH = macd_hist(close)
+    roiPct = (ta.sma(ta.change(close), 10) / close) * 100.0
+    rsi = ta.rsi(close, 14)
+    stochRsi = stochrsi_0_1(close, 14, 14)
+    atr = ta.atr(14)
+    adx = adx_val(14)
+    willr = willr_val(14)
+    cci = ta.cci(close, 20)
+    uo = uo_val(7, 14, 28)
+    vol = volume
+    volAvg = ta.sma(volume, 20)
+    [mom, ema12, macdH, roiPct, rsi, stochRsi, atr, adx, willr, cci, uo, vol, volAvg]
+
+// 15m bias (computed once and reused for all rows)
+[biasClose15, biasEma15] = request.security(syminfo.tickerid, TF_15M, [close, ta.ema(close, emaBiasLen)], barmerge.gaps_off, barmerge.lookahead_off)
+biasLong = not na(biasClose15) and not na(biasEma15) and biasClose15 > biasEma15
+biasShort = not na(biasClose15) and not na(biasEma15) and biasClose15 < biasEma15
+
+// Color logic
+val_color(val, ind) =>
+    if ind == "ATR(14)" or ind == "EMA(12)"
+        color.white
+    else if ind == "RSI(14)" or ind == "UO(7,14,28)"
+        val >= 50 ? color.lime : color.red
+    else if ind == "StochRSI(14)"
+        val >= 0.5 ? color.lime : color.red
+    else if ind == "%R(14)"
+        val > -50 ? color.lime : color.red
+    else if ind == "ADX(14)"
+        val >= 20 ? color.lime : color.red
+    else if ind == "CCI(20)"
+        val >= 0 ? color.lime : color.red
+    else
+        val >= 0 ? color.lime : color.red
+
+// Build header once
+var bool built = false
+if not built
+    table.cell(dash, 0, 0, "TF ⓘ", text_color=color.white, bgcolor=color.gray, tooltip="Timeframe for the row. Each row shows the same indicators computed on that timeframe.")
+    header_cell(1, array.get(ind_names, 0), "Mom(5): price momentum over the last 5 bars (close - close[5]). Positive suggests recent upward pressure; negative suggests downward pressure.")
+    header_cell(2, array.get(ind_names, 1), "EMA(12): 12-period exponential moving average (trend baseline). Price above it is often treated as bullish bias; below it bearish bias.")
+    header_cell(3, array.get(ind_names, 2), "MACD(H): MACD histogram (MACD line minus signal line). Above 0 suggests bullish momentum; below 0 bearish momentum.")
+    header_cell(4, array.get(ind_names, 3), "ROI%: average 10-bar change relative to price, expressed as percent. Helps compare recent drift across timeframes.")
+    header_cell(5, array.get(ind_names, 4), "RSI(14): momentum oscillator (0–100). Above 50 is often bullish bias; below 50 bearish. Extremes can indicate overbought/oversold.")
+    header_cell(6, array.get(ind_names, 5), "StochRSI(14): RSI normalized to 0–1 over the last 14 RSI values. Near 1 = RSI near its recent highs; near 0 = RSI near its recent lows.")
+    header_cell(7, array.get(ind_names, 6), "ATR(14): average true range (volatility). Higher ATR means bigger typical swings; useful for stops/targets and sizing.")
+    header_cell(8, array.get(ind_names, 7), "ADX(14): trend strength (not direction). Above ~20 suggests a stronger trend environment; below ~20 suggests chop/range.")
+    header_cell(9, array.get(ind_names, 8), "Williams %R(14): momentum/overbought-oversold (-100 to 0). Closer to 0 = stronger/overbought; closer to -100 = weaker/oversold.")
+    header_cell(10, array.get(ind_names, 9), "CCI(20): deviation from a moving average. Above 0 suggests strength vs average; below 0 suggests weakness. Larger magnitude = stronger deviation.")
+    header_cell(11, array.get(ind_names, 10), "UO(7,14,28): Ultimate Oscillator (0–100) blends 3 lookbacks. Above 50 often treated as bullish bias; below 50 bearish bias.")
+    header_cell(12, array.get(ind_names, 11), "Vol(x): current volume divided by its 20-period average (x1.00 = normal). Higher values mean above-average participation; low values mean thin participation.")
+    header_cell(13, array.get(ind_names, 12), "Bias(15m): directional filter using 15m close vs 15m EMA(" + str.tostring(emaBiasLen) + "). LONG when above EMA, SHORT when below EMA.")
+    header_cell(14, array.get(ind_names, 13), "Signal: quick trade-ready direction based on Bias(15m) + this row's momentum/RSI/MACD + volume participation. Use as a filter, not a guarantee.")
+    table.cell(dash, 0, 1, "1 min",  text_color=color.yellow, bgcolor=color.navy)
+    table.cell(dash, 0, 2, "3 min",  text_color=color.yellow, bgcolor=color.navy)
+    table.cell(dash, 0, 3, "5 min",  text_color=color.yellow, bgcolor=color.navy)
+    table.cell(dash, 0, 4, "15 min", text_color=color.yellow, bgcolor=color.navy)
+    table.cell(dash, 0, 5, "1 Hour", text_color=color.yellow, bgcolor=color.navy)
+    table.cell(dash, 0, 6, "4 Hour", text_color=color.yellow, bgcolor=color.navy)
+    table.cell(dash, 0, 7, "Daily",  text_color=color.yellow, bgcolor=color.navy)
+    built := true
+
+update_row(tf, tableRow) =>
+    [mom, ema12, macdH, roiPct, rsi, stochRsi, atr, adx, willr, cci, uo, vol, volAvg] = request.security(syminfo.tickerid, tf, calc_metrics(), barmerge.gaps_off, barmerge.lookahead_off)
+
+    if barstate.islast
+        table.cell(dash, 1, tableRow, fmt(mom), text_color=val_color(mom, "Mom(5)"))
+        table.cell(dash, 2, tableRow, fmt(ema12), text_color=color.white)
+        table.cell(dash, 3, tableRow, fmt(macdH), text_color=val_color(macdH, "MACD(H)"))
+        table.cell(dash, 4, tableRow, fmt(roiPct), text_color=val_color(roiPct, "ROI%"))
+        table.cell(dash, 5, tableRow, fmt(rsi), text_color=val_color(rsi, "RSI(14)"))
+        table.cell(dash, 6, tableRow, fmt(stochRsi), text_color=val_color(stochRsi, "StochRSI(14)"))
+        table.cell(dash, 7, tableRow, fmt(atr), text_color=color.white)
+        table.cell(dash, 8, tableRow, fmt(adx), text_color=val_color(adx, "ADX(14)"))
+        table.cell(dash, 9, tableRow, fmt(willr), text_color=val_color(willr, "%R(14)"))
+        table.cell(dash, 10, tableRow, fmt(cci), text_color=val_color(cci, "CCI(20)"))
+        table.cell(dash, 11, tableRow, fmt(uo), text_color=val_color(uo, "UO(7,14,28)"))
+
+        biasText = biasLong ? "LONG" : biasShort ? "SHORT" : "—"
+        biasColor = biasLong ? color.lime : biasShort ? color.red : color.gray
+        biasTip = "15m Bias\nClose: " + fmt(biasClose15) + "\nEMA(" + str.tostring(emaBiasLen) + "): " + fmt(biasEma15)
+        table.cell(dash, 13, tableRow, biasText, text_color=biasColor, tooltip=biasTip)
+
+        volX = na(volAvg) or volAvg == 0 ? na : (vol / volAvg)
+        volColor = na(volX) ? color.white : (volX >= 1.30 ? color.lime : volX <= 0.70 ? color.red : color.gray)
+        volTip = "Volume: " + fmt_vol(vol) + "\nAvg(20): " + fmt_vol(volAvg)
+        table.cell(dash, 12, tableRow, fmt_volx(vol, volAvg), text_color=volColor, tooltip=volTip)
+
+        longOk = biasLong and mom > 0 and macdH > 0 and rsi >= 50 and (not na(volX) and volX >= 1.0)
+        shortOk = biasShort and mom < 0 and macdH < 0 and rsi < 50 and (not na(volX) and volX >= 1.0)
+        signalText = longOk ? "LONG" : shortOk ? "SHORT" : "—"
+        signalColor = longOk ? color.lime : shortOk ? color.red : color.gray
+        signalTip = "Signal logic\nBias: " + biasText + "\nMom: " + fmt(mom) + "\nMACD(H): " + fmt(macdH) + "\nRSI: " + fmt(rsi) + "\nVol(x): " + fmt_volx(vol, volAvg)
+        table.cell(dash, 14, tableRow, signalText, text_color=signalColor, tooltip=signalTip)
+
+update_row(TF_1M, 1)
+update_row(TF_3M, 2)
+update_row(TF_5M, 3)
+update_row(TF_15M, 4)
+update_row(TF_1H, 5)
+update_row(TF_4H, 6)
+update_row(TF_1D, 7)
